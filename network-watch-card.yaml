@@ -1,0 +1,88 @@
+title: Network Watch
+views:
+  # -------------------------------------------------------------
+  - title: Watch
+    path: watch
+    icon: mdi:shield-home
+    cards:
+      - type: entities
+        title: Status
+        entities:
+          - entity: sensor.netwatch_unknown_devices
+            name: Unknown devices on the network now
+          - entity: sensor.netwatch_device_book
+            name: Devices in my book
+          - entity: input_boolean.netwatch_guest_mode
+            name: Guest mode (silences phone alerts)
+
+      - type: markdown
+        title: ⚠️ Unknown right now
+        content: >
+          {% set l = state_attr('sensor.netwatch_unknown_devices','devices') or [] %}
+          {% if l | count == 0 %}
+          Nothing unknown is connected. 👍
+          {% else %}
+          | IP | Device name | Maker | MAC | Hint |
+          |---|---|---|---|---|
+          {% for d in l -%}
+          | {{ d.ip }} | {{ d.host or '–' }} | {{ d.maker or '–' }} | {{ d.mac }} | {% if d.likely %}🟡 like "{{ d.likely }}"{% elif d.private %}private MAC{% else %}real MAC{% endif %} |
+          {% endfor %}
+          {% endif %}
+          Go to the **Enroll** tab to trust or name them.
+
+      - type: markdown
+        title: ✅ My devices
+        content: >
+          {% set book = state_attr('sensor.netwatch_device_book','devices') or [] %}
+          | Name | Now | IP | Hostname |
+          |---|---|---|---|
+          {% for b in book if b.mac != '' -%}
+          {% set t = (states.device_tracker | selectattr('attributes.mac','defined') | selectattr('attributes.mac','in',[b.mac, b.mac | upper]) | list | first) | default(none) -%}
+          | {{ b.name }} | {{ '🟢 online' if t is not none and t.state == 'home' else '⚪ away' }} | {{ t.attributes.ip if t is not none else '–' }} | {{ b.host or '–' }} |
+          {% endfor %}
+
+  # -------------------------------------------------------------
+  - title: Enroll
+    path: enroll
+    icon: mdi:plus-network
+    cards:
+      - type: entities
+        title: Add a device to my book
+        entities:
+          - input_select.netwatch_pick
+          - input_text.netwatch_name
+          - input_text.netwatch_note
+          - type: button
+            name: Trust this device
+            icon: mdi:check-network
+            action_name: TRUST
+            tap_action:
+              action: perform-action
+              perform_action: script.netwatch_trust_selected
+
+      - type: entities
+        title: First-time shortcut
+        entities:
+          - type: button
+            name: Trust EVERYTHING connected right now
+            icon: mdi:playlist-check
+            action_name: BASELINE
+            tap_action:
+              action: perform-action
+              perform_action: script.netwatch_trust_all_current
+              confirmation:
+                text: >-
+                  Only do this if every device on your network right now is
+                  yours (ideally just after you changed the Wi-Fi password and
+                  reconnected your own devices). Continue?
+
+      - type: todo-list
+        entity: todo.device_book
+        title: My devices – tap one to rename, add a note, or delete
+
+      - type: markdown
+        content: >
+          **Renaming:** tap an item in the list above and change its title.
+          Keep the `mac | hostname | note` line in the description; the MAC
+          is how the device is recognised.
+          **Removing a device from trusted:** swipe/delete it from the list.

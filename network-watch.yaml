@@ -1,0 +1,364 @@
+# =====================================================================
+#  NETWORK WATCH  –  "who just joined my Wi-Fi?" tripwire for Home Assistant
+#  File: /config/packages/network_watch.yaml
+#
+#  Needs (both added from the UI, see README):
+#    1. Nmap Tracker integration        -> creates device_tracker.* per device
+#    2. Local To-do integration named   -> "Device Book"  (entity todo.device_book)
+#
+#  The Device Book is the list of devices you trust. One to-do item per device:
+#      item title   = the friendly name you see and can edit anytime
+#      description  = "<mac> | <hostname> | <your note>"
+#
+#  BEFORE YOU RESTART: find/replace  notify.mobile_app_YOUR_PHONE  (2 places,
+#  both in script.netwatch_push) with your real notify service, e.g.
+#  notify.mobile_app_pixel_8   (Developer Tools -> Actions, search "mobile_app")
+# =====================================================================
+
+input_boolean:
+  netwatch_guest_mode:
+    name: Network Watch – guest mode (no push alerts)
+    icon: mdi:account-multiple
+
+input_select:
+  netwatch_pick:
+    name: Unknown device waiting
+    icon: mdi:lan-pending
+    options:
+      - "(none waiting)"
+
+input_text:
+  netwatch_name:
+    name: Name (leave empty = auto)
+    icon: mdi:tag
+    max: 60
+  netwatch_note:
+    name: Note (optional)
+    icon: mdi:note-text
+    max: 100
+
+template:
+  # ---------------------------------------------------------------
+  # 1) DEVICE BOOK  – reads todo.device_book into a sensor
+  # ---------------------------------------------------------------
+  - triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: state
+        entity_id: todo.device_book
+      - trigger: event
+        event_type: netwatch_book_changed
+      - trigger: time_pattern
+        minutes: "/5"
+    actions:
+      - action: todo.get_items
+        target:
+          entity_id: todo.device_book
+        data:
+          status:
+            - needs_action
+            - completed
+        response_variable: book
+    sensor:
+      - name: "Netwatch device book"
+        unique_id: netwatch_device_book
+        icon: mdi:book-lock
+        state: "{{ book['todo.device_book']['items'] | count }}"
+        attributes:
+          devices: >-
+            {% set ns = namespace(out=[]) %}
+            {%- for i in book['todo.device_book']['items'] -%}
+              {%- set d = i.description | default('', true) | string -%}
+              {%- set mac = (d | lower | regex_findall('[0-9a-f]{2}(?::[0-9a-f]{2}){5}')) | first | default('', true) -%}
+              {%- set parts = d.split('|') -%}
+              {%- set host = (parts[1] | trim | lower) if parts | length > 1 else '' -%}
+              {%- set ns.out = ns.out + [{'name': i.summary, 'mac': mac, 'host': host}] -%}
+            {%- endfor -%}
+            {{ ns.out }}
+
+  # ---------------------------------------------------------------
+  # 2) UNKNOWN DEVICES  – on Wi-Fi/LAN right now, not in the book
+  # ---------------------------------------------------------------
+  - sensor:
+      - name: "Netwatch unknown devices"
+        unique_id: netwatch_unknown_devices
+        icon: mdi:lan-pending
+        # Stay unavailable until the book is loaded, so a restart can never
+        # make *every* device look unknown.
+        availability: "{{ states('sensor.netwatch_device_book') | is_number }}"
+        state: >-
+          {% set macs = state_attr('sensor.netwatch_device_book','devices') | default([], true) | map(attribute='mac') | list %}
+          {{ states.device_tracker
+             | selectattr('state','eq','home')
+             | selectattr('attributes.source_type','eq','router')
+             | selectattr('attributes.mac','defined')
+             | map(attribute='attributes.mac') | map('lower')
+             | reject('in', macs) | list | count }}
+        attributes:
+          devices: >-
+            {% set known = state_attr('sensor.netwatch_device_book','devices') | default([], true) %}
+            {%- set macs = known | map(attribute='mac') | list -%}
+            {%- set ns = namespace(out=[]) -%}
+            {%- for t in states.device_tracker
+                  | selectattr('state','eq','home')
+                  | selectattr('attributes.source_type','eq','router')
+                  | selectattr('attributes.mac','defined') -%}
+              {%- set mac = t.attributes.mac | lower -%}
+              {%- if mac not in macs -%}
+                {%- set ip = t.attributes.ip | default('', true) | string -%}
+                {%- set host = t.attributes.host_name | default('', true) | string | lower -%}
+                {%- set host = '' if host == ip else host -%}
+                {%- set twin = (known | selectattr('host','eq',host) | map(attribute='name') | first | default('', true)) if host != '' else '' -%}
+                {%- set maker = device_attr(t.entity_id, 'manufacturer') | default('', true) | string -%}
+                {%- set ns.out = ns.out + [{
+                      'entity_id': t.entity_id,
+                      'mac': mac,
+                      'ip': ip,
+                      'host': host,
+                      'maker': maker,
+                      'private': mac[1] in ['2','6','a','e'],
+                      'likely': twin,
+                      'label': ip ~ ' · ' ~ (host if host != '' else (maker if maker != '' else 'no name')) ~ ' · ' ~ mac
+                    }] -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ ns.out }}
+
+automation:
+  # ---------------------------------------------------------------
+  # A) Keep the "Unknown device waiting" dropdown in sync
+  # ---------------------------------------------------------------
+  - id: netwatch_sync_picker
+    alias: "Network Watch – keep enroll dropdown in sync"
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: sensor.netwatch_unknown_devices
+        attribute: devices
+      - trigger: homeassistant
+        event: start
+    actions:
+      - variables:
+          devs: "{{ state_attr('sensor.netwatch_unknown_devices','devices') | default([], true) }}"
+      - action: input_select.set_options
+        target:
+          entity_id: input_select.netwatch_pick
+        data:
+          options: "{{ ['(none waiting)'] + (devs | map(attribute='label') | list) }}"
+      - if:
+          - condition: template
+            value_template: "{{ devs | count > 0 and is_state('input_select.netwatch_pick', '(none waiting)') }}"
+        then:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.netwatch_pick
+            data:
+              option: "{{ devs[0].label }}"
+
+  # ---------------------------------------------------------------
+  # B) Alert when a NEW unknown device appears
+  # ---------------------------------------------------------------
+  - id: netwatch_alert_new_device
+    alias: "Network Watch – alert on new unknown device"
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: sensor.netwatch_unknown_devices
+        attribute: devices
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.to_state is not none and trigger.to_state.attributes.devices is defined }}"
+    actions:
+      - variables:
+          fresh: >-
+            {% set cur = trigger.to_state.attributes.devices | default([], true) %}
+            {%- set had = (trigger.from_state.attributes.devices | default([], true)) if trigger.from_state is not none else [] -%}
+            {{ cur | rejectattr('mac', 'in', had | map(attribute='mac') | list) | list }}
+      - condition: template
+        value_template: "{{ fresh | count > 0 }}"
+      - repeat:
+          for_each: "{{ fresh }}"
+          sequence:
+            - variables:
+                d: "{{ repeat.item }}"
+                likely: "{{ d.likely | default('', true) }}"
+                headline: >-
+                  {% if likely != '' -%}
+                    Same device name as "{{ likely }}" but a new MAC - probably yours, please confirm
+                  {%- elif d.private -%}
+                    Private/random MAC (typical of a phone using Private Wi-Fi Address)
+                  {%- else -%}
+                    Real hardware MAC{% if d.maker %} ({{ d.maker }}){% endif %}
+                  {%- endif %}
+                body: "{{ d.ip }} · name: {{ d.host or 'none' }}\n{{ headline }}\nMAC {{ d.mac }}"
+            - action: persistent_notification.create
+              data:
+                notification_id: "nw_{{ d.mac | replace(':', '') }}"
+                title: "Unknown device on your network"
+                message: "{{ body }}"
+            - if:
+                - condition: state
+                  entity_id: input_boolean.netwatch_guest_mode
+                  state: "off"
+              then:
+                - action: script.netwatch_push
+                  data:
+                    title: "{{ '🟡 Probably yours?' if likely != '' else '⚠️ New device on your network' }}"
+                    message: "{{ body }}"
+                    mac: "{{ d.mac }}"
+
+  # ---------------------------------------------------------------
+  # C) Handle the buttons on the phone notification
+  # ---------------------------------------------------------------
+  - id: netwatch_notification_buttons
+    alias: "Network Watch – handle notification buttons"
+    mode: queued
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+    conditions:
+      - condition: template
+        value_template: "{{ (trigger.event.data.action | default('') | string).startswith('NW_') }}"
+    actions:
+      - variables:
+          kind: "{{ trigger.event.data.action.split('|')[0] }}"
+          mac: "{{ trigger.event.data.action.split('|')[1] | default('') }}"
+      - choose:
+          - conditions: "{{ kind == 'NW_TRUST' }}"
+            sequence:
+              - action: script.netwatch_trust
+                data:
+                  mac: "{{ mac }}"
+                  name: ""
+                  note: "trusted from notification"
+          - conditions: "{{ kind == 'NW_BAD' }}"
+            sequence:
+              - action: logbook.log
+                data:
+                  name: "Network Watch"
+                  message: "Marked NOT MINE: {{ mac }}"
+              - action: script.netwatch_push
+                data:
+                  title: "🚨 Possible intruder ({{ mac }})"
+                  message: >-
+                    Do now: 1) change the Wi-Fi password, 2) switch WPS off,
+                    3) reconnect your own devices. You will be alerted again
+                    every time this device returns.
+
+script:
+  # ---------------------------------------------------------------
+  # Push to your phone (edit the notify service here, 2 places)
+  # ---------------------------------------------------------------
+  netwatch_push:
+    alias: "Network Watch – push to phone"
+    mode: queued
+    fields:
+      title:
+        description: Notification title
+      message:
+        description: Notification text
+      mac:
+        description: If set, the notification gets the 3 action buttons
+    sequence:
+      - if:
+          - condition: template
+            value_template: "{{ mac | default('') != '' }}"
+        then:
+          - action: notify.mobile_app_YOUR_PHONE
+            data:
+              title: "{{ title }}"
+              message: "{{ message }}"
+              data:
+                tag: "nw_{{ mac | replace(':', '') }}"
+                actions:
+                  - action: "NW_TRUST|{{ mac }}"
+                    title: "✅ That's mine"
+                  - action: URI
+                    title: "✏️ Name it"
+                    uri: "/network-watch/enroll"
+                  - action: "NW_BAD|{{ mac }}"
+                    title: "🚨 Not mine"
+        else:
+          - action: notify.mobile_app_YOUR_PHONE
+            data:
+              title: "{{ title }}"
+              message: "{{ message }}"
+
+  # ---------------------------------------------------------------
+  # Add one device to the Device Book
+  # ---------------------------------------------------------------
+  netwatch_trust:
+    alias: "Network Watch – trust a device"
+    mode: queued
+    fields:
+      mac:
+        description: MAC address of the device
+        example: "aa:bb:cc:dd:ee:ff"
+      name:
+        description: Friendly name (empty = automatic)
+        example: "Ali's iPhone"
+      note:
+        description: Optional note
+    sequence:
+      - variables:
+          m: "{{ mac | lower | trim }}"
+          book_macs: "{{ state_attr('sensor.netwatch_device_book','devices') | default([], true) | map(attribute='mac') | list }}"
+          dev: "{{ (state_attr('sensor.netwatch_unknown_devices','devices') | default([], true) | selectattr('mac', 'eq', m) | list | first) | default({}, true) }}"
+          host: "{{ dev.host | default('', true) }}"
+          maker: "{{ dev.maker | default('', true) }}"
+          tail: "{{ m[-5:] | replace(':', '') }}"
+          typed: "{{ name | default('', true) | trim }}"
+          label: >-
+            {% if typed != '' %}{{ typed }}{% else %}{{ host if host != '' else (maker if maker != '' else 'Device') }} {{ tail }}{% endif %}
+      - condition: template
+        value_template: "{{ m != '' and m not in book_macs }}"
+      - action: todo.add_item
+        target:
+          entity_id: todo.device_book
+        data:
+          item: "{{ label }}"
+          description: "{{ m }} | {{ host }} | {{ note | default('', true) }}"
+      - event: netwatch_book_changed
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: "nw_{{ m | replace(':', '') }}"
+
+  # ---------------------------------------------------------------
+  # Dashboard helpers
+  # ---------------------------------------------------------------
+  netwatch_trust_selected:
+    alias: "Network Watch – trust the device picked on the dashboard"
+    mode: single
+    sequence:
+      - variables:
+          mac: "{{ states('input_select.netwatch_pick') | regex_findall('[0-9a-f]{2}(?::[0-9a-f]{2}){5}') | first | default('', true) }}"
+      - condition: template
+        value_template: "{{ mac != '' }}"
+      - action: script.netwatch_trust
+        data:
+          mac: "{{ mac }}"
+          name: "{{ states('input_text.netwatch_name') }}"
+          note: "{{ states('input_text.netwatch_note') }}"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.netwatch_name
+        data:
+          value: ""
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.netwatch_note
+        data:
+          value: ""
+
+  netwatch_trust_all_current:
+    alias: "Network Watch – BASELINE: trust everything connected now"
+    mode: single
+    sequence:
+      - repeat:
+          for_each: "{{ state_attr('sensor.netwatch_unknown_devices','devices') | default([], true) }}"
+          sequence:
+            - action: script.netwatch_trust
+              data:
+                mac: "{{ repeat.item.mac }}"
+                name: ""
+                note: "baseline {{ now().strftime('%Y-%m-%d') }}"
